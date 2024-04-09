@@ -119,7 +119,9 @@ class BloxManager(object):
             if job_state.active_jobs[jid]["is_running"] == True:
                 job_id_to_fetch.append(jid)
                 if_simulation.append(job_state.active_jobs[jid]["simulation"])
-                ipaddress_to_fetch_from.append(job_state.active_jobs[jid]["rank_0_ip"])
+                ipaddress_to_fetch_from.append(
+                    job_state.active_jobs[jid]["running_ip_address"]
+                )
         metric_data = self.comm_node_manager.get_metrics(
             job_id_to_fetch,
             ipaddress_to_fetch_from,
@@ -326,6 +328,7 @@ class BloxManager(object):
           None
         """
         terminate_list_id = list()
+        terminate_rank_0_ipaddr = list()
         terminate_ipaddr = list()
         terminate_simulation = list()
         print("Job IDs to terminate {}".format(jobs_to_terminate))
@@ -334,14 +337,19 @@ class BloxManager(object):
             running_ipddr = list(
                 set(_find_ipaddr_by_job_ids(jid, cluster_state.gpu_df))
             )
-            terminate_list_id.extend([jid] * len(running_ipddr))
-            terminate_ipaddr.extend(running_ipddr)
-            terminate_simulation.extend(
-                [active_jobs.active_jobs[jid]["simulation"]] * len(running_ipddr)
-            )
+            rank_0_ipaddr = active_jobs.active_jobs[jid]["rank_0_ip"]
+            # terminate_list_id.extend([jid] * len(running_ipddr))
+            terminate_list_id.append(jid)
+            terminate_rank_0_ipaddr.append(rank_0_ipaddr)
+            terminate_ipaddr.append(running_ipddr)
+            # terminate_simulation.extend(
+            # [active_jobs.active_jobs[jid]["simulation"]] * len(running_ipddr)
+            # )
+            terminate_simulation.append(active_jobs.active_jobs[jid]["simulation"])
             # mark the job that is running is false
             active_jobs.active_jobs[jid]["is_running"] = False
             active_jobs.active_jobs[jid]["rank_0_ip"] = None
+            active_jobs.active_jobs[jid]["running_ip_address"] = None
             # the job was suspended
             active_jobs.active_jobs[jid]["suspended"] = 1
             # mark corresponding GPUs on which the jobs are running as
@@ -349,12 +357,14 @@ class BloxManager(object):
             _free_gpu_by_jobid(jid, cluster_state.gpu_df)
 
         self.comm_node_manager.terminate_jobs(
-            terminate_list_id, terminate_ipaddr, terminate_simulation
+            terminate_list_id,
+            terminate_rank_0_ipaddr,
+            terminate_ipaddr,
+            terminate_simulation,
         )
 
         # jobs terminated
-
-        for jid in jobs_to_launch:
+        def launch_job_func(jid):
             gpus_to_launch = jobs_to_launch[jid]
             ipaddress_to_launch = _find_ipaddr_by_gpu_ids(
                 gpus_to_launch, cluster_state.gpu_df
@@ -364,11 +374,29 @@ class BloxManager(object):
                 jid, active_jobs.active_jobs[jid], local_gpu_ids, ipaddress_to_launch
             )
             active_jobs.active_jobs[jid]["is_running"] = True
-            active_jobs.active_jobs[jid]["rank_0_ip"] = list(set(ipaddress_to_launch))
+            active_jobs.active_jobs[jid]["rank_0_ip"] = list(set(ipaddress_to_launch))[
+                0
+            ]
+
+            active_jobs.active_jobs[jid]["running_ip_address"] = list(
+                set(ipaddress_to_launch)
+            )
 
             if "suspended" in active_jobs.active_jobs[jid]:
                 active_jobs.active_jobs[jid]["suspended"] = 0
             _mark_gpu_in_use_by_gpu_id(gpus_to_launch, jid, cluster_state.gpu_df)
+            return True
+
+        # for jid in jobs_to_launch:
+        with futures.ThreadPoolExecutor(max_workers=16) as executor:
+            future_results = [
+                executor.submit(launch_job_func, jid) for jid in jobs_to_launch
+            ]
+
+            results = [
+                future.result() for future in futures.as_completed(future_results)
+            ]
+            print("Launched")
 
         # update the time for training
 

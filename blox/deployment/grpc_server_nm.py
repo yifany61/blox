@@ -34,7 +34,6 @@ class NMServer(nm_pb2_grpc.NMServerServicer):
         )
 
         # Will keep job terminate ids in this list
-        self.job_terminate_ids = list()
         # else:
         # # configuring local data store with python dict
         # self.local_data_store = DataRelay()
@@ -43,13 +42,55 @@ class NMServer(nm_pb2_grpc.NMServerServicer):
         """
         Check if all jobs in the terminate list have terminated before finishing the launch.
         """
-        if len(self.job_terminate_ids) > 0:
-            while len(self.job_terminate_ids) > 0:
-                jid_to_test = self.job_terminate_ids.pop()
+        print("Ensuring previous round has terminated")
+        jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+        while jid_to_test is not None:
+            job_status = self.local_data_store.get_job_status(jid_to_test)
+            while job_status != "exit":
+                time.sleep(1)
+                job_status = self.local_data_store.get_job_status(jid_to_test)
+            out_val = self.local_data_store.push_terminated_jobs(jid_to_test)
+            jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+        # all workers are done with checking if each individual job has finished.
+
+        # now we need to make sure all jobs have been finished
+        # this involves combining two lists
+
+        # terminated_job_lists = self.local_data_store.get_terminated_jobs()
+        # all_job_to_terminate = self.local_data_store.get_jobs_to_terminate()
+
+        # time to check if elements are all there
+        all_terminated = False
+
+        while not all_terminated:
+            all_terminated = True
+            jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+            while jid_to_test is not None:
                 job_status = self.local_data_store.get_job_status(jid_to_test)
                 while job_status != "exit":
                     time.sleep(1)
                     job_status = self.local_data_store.get_job_status(jid_to_test)
+                out_val = self.local_data_store.push_terminated_jobs(jid_to_test)
+                jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+            terminated_job_lists = self.local_data_store.get_terminated_jobs()
+            all_job_to_terminate = self.local_data_store.get_jobs_to_terminate()
+            print("Terminated job list {}".format(terminated_job_list))
+            print("All jobs to terminate {}".format(all_job_to_terminate))
+            for terminate_id in all_job_to_terminate:
+                if terminate_id not in terminated_job_lists:
+                    all_terminated = False
+                    time.sleep(1)
+        print("All jobs terminated")
+
+        return None
+
+        # if len(self.job_terminate_ids) > 0:
+        # while len(self.job_terminate_ids) > 0:
+        # jid_to_test = self.job_terminate_ids.pop()
+        # job_status = self.local_data_store.get_job_status(jid_to_test)
+        # while job_status != "exit":
+        # time.sleep(1)
+        # job_status = self.local_data_store.get_job_status(jid_to_test)
 
     def LaunchJob(self, request, context) -> rm_pb2.BooleanResponse:
         """
@@ -69,6 +110,7 @@ class NMServer(nm_pb2_grpc.NMServerServicer):
         # check if all previous jobs have terminated
         self.ensure_terminate_status()
         self.local_data_store.set_lease_status(received_job["job_id"], True)
+        self.local_data_store.set_lease_status_rank0(received_job["job_id"], [], True)
         self.local_data_store.set_job_status(received_job["job_id"], "running")
         # os.environ["BLOX_JOB_ID"] = str(received_job["job_id"])
         # os.environ["GPU_ID"] = str(received_job["local_GPU_ID"])
@@ -102,13 +144,38 @@ class NMServer(nm_pb2_grpc.NMServerServicer):
 
     def TerminateJob(self, request, context) -> rm_pb2.BooleanResponse:
         """
+        This is called from Rank 0
         Terminate Job post launch. This will terminate lease. Which when read
         by blox iterator will terminate the job.
+        This is has been called by the node manager
         """
         print("Called Terminate")
+        all_job_ids_to_terminate = json.loads(request.response)["Job_ID_list"]
+        all_corresponding_ip_address_to_terminate = json.loads(request.response)[
+            "IP_addr_terminate"
+        ]
+        print("Terminate Jobs {}".format(all_job_ids_to_terminate))
+        # self.job_terminate_ids.append(job_id_to_terminate)
+
+        self.local_data_store.set_lease_status_rank0_batch_false(
+            all_job_ids_to_terminate, all_corresponding_ip_address_to_terminate
+        )
+        # self.local_data_store.push_job_to_terminate(job_id_to_terminate)
+        # self.local_data_store.set_lease_status_rank0(
+        # job_id_to_terminate, ipaddr_to_terminate, False
+        # )
+        return rm_pb2.BooleanResponse(value=True)
+
+    def TerminateJobfromPeer(self, request, context) -> rm_pb2.BooleanResponse:
+        """
+        Terminate a job. Whose termination direction is recieved from peers
+        Note: Every job is terminated by call from peer. This is called from Rank0
+        """
+        print("Called Terminate from Peer")
         job_id_to_terminate = json.loads(request.response)["Job_ID"]
         print("Terminate Job {}".format(job_id_to_terminate))
-        self.job_terminate_ids.append(job_id_to_terminate)
+        # self.job_terminate_ids.append(job_id_to_terminate)
+        # self.local_data_store.push_job_to_terminate(job_id_to_terminate)
         self.local_data_store.set_lease_status(job_id_to_terminate, False)
         return rm_pb2.BooleanResponse(value=True)
 
@@ -116,6 +183,7 @@ class NMServer(nm_pb2_grpc.NMServerServicer):
         """
         Return metrics as requested by resource manager
         """
+        self.local_data_store.delete_all_job_terminate_list()
         received_job = json.loads(request.response)
         job_data = self.local_data_store.get_job_metrics(received_job["Job_ID"])
         # data_to_send = dict()
@@ -220,7 +288,7 @@ def server(node_manager_port: int):
     Node Manager Port
     node_manager_port (int): Node Manager Port
     """
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=20))
     rm_pb2_grpc.add_RMServerServicer_to_server(NMServer(), server)
     server.add_insecure_port(f"[::]:{node_manager_port}")
     server.start()
